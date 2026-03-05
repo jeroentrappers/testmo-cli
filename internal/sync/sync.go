@@ -13,6 +13,7 @@ import (
 // YAMLFile represents the top-level sync file.
 type YAMLFile struct {
 	Project int          `yaml:"project"`
+	Folder  int          `yaml:"folder,omitempty"`
 	Folders []YAMLFolder `yaml:"folders"`
 }
 
@@ -85,11 +86,47 @@ func SaveYAML(path string, f *YAMLFile) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// PullToYAML fetches all folders and cases from Testmo and builds a YAML file.
-func PullToYAML(client *api.Client, projectID int) (*YAMLFile, error) {
+// PullToYAML fetches folders and cases from Testmo and builds a YAML file.
+// If folderID is non-nil, only the subtree rooted at that folder is included.
+func PullToYAML(client *api.Client, projectID int, folderID *int) (*YAMLFile, error) {
 	folders, err := client.ListFolders(projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list folders: %w", err)
+	}
+
+	// If scoped to a folder, filter to only the subtree
+	folderSet := make(map[int]bool)
+	if folderID != nil {
+		// Find the root folder and all descendants
+		childMap := make(map[int][]int) // parentID -> child IDs
+		for _, f := range folders {
+			if f.ParentID != nil {
+				childMap[*f.ParentID] = append(childMap[*f.ParentID], f.ID)
+			}
+		}
+		var collect func(id int)
+		collect = func(id int) {
+			folderSet[id] = true
+			for _, childID := range childMap[id] {
+				collect(childID)
+			}
+		}
+		collect(*folderID)
+
+		// Verify the folder exists
+		if !folderSet[*folderID] {
+			found := false
+			for _, f := range folders {
+				if f.ID == *folderID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("folder %d not found in project %d", *folderID, projectID)
+			}
+			folderSet[*folderID] = true
+		}
 	}
 
 	cases, err := client.ListCases(projectID, nil)
@@ -100,6 +137,9 @@ func PullToYAML(client *api.Client, projectID int) (*YAMLFile, error) {
 	// Group cases by folder
 	casesByFolder := make(map[int][]api.Case)
 	for _, c := range cases {
+		if folderID != nil && !folderSet[c.FolderID] {
+			continue
+		}
 		casesByFolder[c.FolderID] = append(casesByFolder[c.FolderID], c)
 	}
 
@@ -114,7 +154,14 @@ func PullToYAML(client *api.Client, projectID int) (*YAMLFile, error) {
 	childFolders := make(map[int][]api.Folder) // parentID -> children
 	var roots []api.Folder
 	for _, f := range folders {
-		if f.ParentID == nil {
+		if folderID != nil && !folderSet[f.ID] {
+			continue
+		}
+		if folderID != nil && f.ID == *folderID {
+			// Skip the scoped folder itself; its children become roots
+			continue
+		}
+		if f.ParentID == nil || (folderID != nil && f.ParentID != nil && *f.ParentID == *folderID) {
 			roots = append(roots, f)
 		} else {
 			childFolders[*f.ParentID] = append(childFolders[*f.ParentID], f)
@@ -156,6 +203,9 @@ func PullToYAML(client *api.Client, projectID int) (*YAMLFile, error) {
 	}
 
 	yamlFile := &YAMLFile{Project: projectID}
+	if folderID != nil {
+		yamlFile.Folder = *folderID
+	}
 	for _, root := range roots {
 		yamlFile.Folders = append(yamlFile.Folders, buildFolder(root))
 	}
@@ -164,15 +214,51 @@ func PullToYAML(client *api.Client, projectID int) (*YAMLFile, error) {
 }
 
 // ComputeDiff compares local YAML against Testmo state and returns what needs to change.
-func ComputeDiff(client *api.Client, projectID int, local *YAMLFile) (*DiffResult, error) {
-	remoteFolders, err := client.ListFolders(projectID)
+// If folderID is non-nil, only the subtree rooted at that folder is compared.
+func ComputeDiff(client *api.Client, projectID int, folderID *int, local *YAMLFile) (*DiffResult, error) {
+	allFolders, err := client.ListFolders(projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list folders: %w", err)
 	}
 
-	remoteCases, err := client.ListCases(projectID, nil)
+	allCases, err := client.ListCases(projectID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list cases: %w", err)
+	}
+
+	// If scoped to a folder, filter to only the subtree
+	var remoteFolders []api.Folder
+	var remoteCases []api.Case
+	if folderID != nil {
+		folderSet := make(map[int]bool)
+		childMap := make(map[int][]int)
+		for _, f := range allFolders {
+			if f.ParentID != nil {
+				childMap[*f.ParentID] = append(childMap[*f.ParentID], f.ID)
+			}
+		}
+		var collect func(id int)
+		collect = func(id int) {
+			folderSet[id] = true
+			for _, childID := range childMap[id] {
+				collect(childID)
+			}
+		}
+		collect(*folderID)
+
+		for _, f := range allFolders {
+			if folderSet[f.ID] {
+				remoteFolders = append(remoteFolders, f)
+			}
+		}
+		for _, c := range allCases {
+			if folderSet[c.FolderID] {
+				remoteCases = append(remoteCases, c)
+			}
+		}
+	} else {
+		remoteFolders = allFolders
+		remoteCases = allCases
 	}
 
 	diff := &DiffResult{}
@@ -270,8 +356,14 @@ func ComputeDiff(client *api.Client, projectID int, local *YAMLFile) (*DiffResul
 		}
 	}
 
+	rootParentID := 0
+	if folderID != nil {
+		rootParentID = *folderID
+		// The scoped folder itself should not be deleted
+		matchedFolders[*folderID] = true
+	}
 	for _, rootFolder := range local.Folders {
-		walkFolder(rootFolder, 0)
+		walkFolder(rootFolder, rootParentID)
 	}
 
 	// Find unmatched remote items (candidates for deletion)

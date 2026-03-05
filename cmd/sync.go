@@ -9,12 +9,14 @@ import (
 
 var (
 	syncProjectID int
+	syncFolderID  int
 	syncFile      string
 )
 
 func init() {
 	rootCmd.AddCommand(syncCmd)
 	syncCmd.PersistentFlags().IntVarP(&syncProjectID, "project", "p", 0, "Project ID (required)")
+	syncCmd.PersistentFlags().IntVar(&syncFolderID, "folder", 0, "Folder ID to scope sync to a subtree")
 	syncCmd.PersistentFlags().StringVarP(&syncFile, "file", "f", "testmo.yaml", "YAML sync file path")
 	syncCmd.MarkPersistentFlagRequired("project")
 
@@ -36,8 +38,13 @@ var syncPullCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client := mustClient()
 
-		fmt.Printf("Pulling from project %d...\n", syncProjectID)
-		yamlFile, err := syncpkg.PullToYAML(client, syncProjectID)
+		folderID := resolveFolderID()
+		if folderID != nil {
+			fmt.Printf("Pulling from project %d, folder %d...\n", syncProjectID, *folderID)
+		} else {
+			fmt.Printf("Pulling from project %d...\n", syncProjectID)
+		}
+		yamlFile, err := syncpkg.PullToYAML(client, syncProjectID, folderID)
 		if err != nil {
 			return err
 		}
@@ -65,8 +72,20 @@ var syncPushCmd = &cobra.Command{
 			return err
 		}
 
+		if local.Project != 0 && local.Project != syncProjectID {
+			return fmt.Errorf("project ID mismatch: --project=%d but %s specifies project: %d", syncProjectID, syncFile, local.Project)
+		}
+
+		folderID := resolveFolderID()
+		if folderID == nil && local.Folder != 0 {
+			folderID = &local.Folder
+		}
+		if folderID != nil && local.Folder != 0 && *folderID != local.Folder {
+			return fmt.Errorf("folder ID mismatch: --folder=%d but %s specifies folder: %d", *folderID, syncFile, local.Folder)
+		}
+
 		fmt.Printf("Computing diff for project %d...\n", syncProjectID)
-		diff, err := syncpkg.ComputeDiff(client, syncProjectID, local)
+		diff, err := syncpkg.ComputeDiff(client, syncProjectID, folderID, local)
 		if err != nil {
 			return err
 		}
@@ -93,8 +112,20 @@ var syncDiffCmd = &cobra.Command{
 			return err
 		}
 
+		if local.Project != 0 && local.Project != syncProjectID {
+			return fmt.Errorf("project ID mismatch: --project=%d but %s specifies project: %d", syncProjectID, syncFile, local.Project)
+		}
+
+		folderID := resolveFolderID()
+		if folderID == nil && local.Folder != 0 {
+			folderID = &local.Folder
+		}
+		if folderID != nil && local.Folder != 0 && *folderID != local.Folder {
+			return fmt.Errorf("folder ID mismatch: --folder=%d but %s specifies folder: %d", *folderID, syncFile, local.Folder)
+		}
+
 		fmt.Printf("Computing diff for project %d...\n", syncProjectID)
-		diff, err := syncpkg.ComputeDiff(client, syncProjectID, local)
+		diff, err := syncpkg.ComputeDiff(client, syncProjectID, folderID, local)
 		if err != nil {
 			return err
 		}
@@ -102,6 +133,13 @@ var syncDiffCmd = &cobra.Command{
 		syncpkg.PrintDiff(diff)
 		return nil
 	},
+}
+
+func resolveFolderID() *int {
+	if syncFolderID != 0 {
+		return &syncFolderID
+	}
+	return nil
 }
 
 func countYAML(f *syncpkg.YAMLFile) (folders, cases int) {
